@@ -1,7 +1,9 @@
--- Enable pgvector (Supabase: Database -> Extensions)
 create extension if not exists vector;
 
-create table if not exists documents (
+drop table if exists chunks cascade;
+drop table if exists documents cascade;
+
+create table documents (
   id uuid primary key default gen_random_uuid(),
   source text not null,
   url text unique not null,
@@ -12,21 +14,20 @@ create table if not exists documents (
   content text not null
 );
 
-create table if not exists chunks (
+create table chunks (
   id bigserial primary key,
   doc_id uuid references documents(id) on delete cascade,
   idx int not null,
   text text not null,
   token_count int not null,
-  embedding vector(1536)
+  embedding vector(768)
 );
 
-create index if not exists chunks_embedding_idx on chunks using ivfflat (embedding vector_cosine_ops) with (lists = 100);
-create index if not exists documents_source_pub_idx on documents (source, published_at desc);
+create index on chunks using ivfflat (embedding vector_cosine_ops) with (lists = 100);
+create index on documents (source, published_at desc);
 
--- similarity search RPC
 create or replace function match_chunks(
-  query_embedding vector(1536),
+  query_embedding vector(768),
   match_count int default 6,
   match_threshold float default 0.2
 )

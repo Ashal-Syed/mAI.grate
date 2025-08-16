@@ -1,10 +1,14 @@
 import 'dotenv/config';
 import crypto from 'node:crypto';
-import pLimit from 'p-limit';
-import fetch from 'node-fetch';
 import * as cheerio from 'cheerio';
 import { createClient } from '@supabase/supabase-js';
-import OpenAI from 'openai';
+import { GoogleGenerativeAI } from '@google/generative-ai';
+import dotenv from 'dotenv';
+import https from 'node:https';
+import http from 'node:http';
+dotenv.config({ path: '.env.local' });
+dotenv.config(); // fallback to .env
+
 
 const SEEDS = [
   'https://immi.homeaffairs.gov.au/visas/getting-a-visa/visa-listing',
@@ -20,17 +24,56 @@ const HOST_ALLOW = [
   'immi.homeaffairs.gov.au', 'www.homeaffairs.gov.au', 'www.legislation.gov.au'
 ];
 
-const CONCURRENCY = 4;
-const MAX_PAGES = 200;
-const CHUNK_TOKENS = 500;
+const CONCURRENCY   = Number(process.env.CRAWL_CONCURRENCY  ?? 4);
+const MAX_PAGES     = Number(process.env.CRAWL_MAX_PAGES    ?? 200);
+const CHUNK_TOKENS  = Number(process.env.CRAWL_CHUNK_TOKENS ?? 500);
+const DELAY_MS      = Number(process.env.CRAWL_DELAY_MS     ?? 300);
 
 const supa = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const genAI = new GoogleGenerativeAI(process.env.GOOGLE_GENAI_API_KEY!);
+const embedModel = genAI.getGenerativeModel({ model: 'text-embedding-004' });
 
 const sha256 = (s: string) => crypto.createHash('sha256').update(s).digest('hex');
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 const okHost = (u: URL) => HOST_ALLOW.includes(u.hostname);
 const disallow = (url: string) => /(\.pdf($|\?))|(\.docx?)|(\.xlsx?)|login|logon|search|sitesearch/i.test(url);
+
+async function fetchUrl(url: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const urlObj = new URL(url);
+    const client = urlObj.protocol === 'https:' ? https : http;
+    
+    const options = {
+      hostname: urlObj.hostname,
+      port: urlObj.port || (urlObj.protocol === 'https:' ? 443 : 80),
+      path: urlObj.pathname + urlObj.search,
+      method: 'GET',
+      headers: {
+        'User-Agent': 'edu-research-bot/0.1'
+      }
+    };
+
+    const req = client.request(options, (res) => {
+      let data = '';
+      res.on('data', (chunk) => {
+        data += chunk;
+      });
+      res.on('end', () => {
+        if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
+          resolve(data);
+        } else {
+          reject(new Error(`HTTP ${res.statusCode}`));
+        }
+      });
+    });
+
+    req.on('error', (err) => {
+      reject(err);
+    });
+
+    req.end();
+  });
+}
 
 function extract(html: string) {
   const $ = cheerio.load(html);
@@ -53,10 +96,7 @@ function chunk(text: string, target = CHUNK_TOKENS) {
   let tokens = 0;
   for (const p of paras) {
     const t = estTokens(p);
-    if (tokens + t > target && buf.length) {
-      out.push(buf.join('\n\n'));
-      buf = []; tokens = 0;
-    }
+    if (tokens + t > target && buf.length) { out.push(buf.join('\n\n')); buf = []; tokens = 0; }
     buf.push(p); tokens += t;
   }
   if (buf.length) out.push(buf.join('\n\n'));
@@ -64,17 +104,17 @@ function chunk(text: string, target = CHUNK_TOKENS) {
 }
 
 async function embedBatch(texts: string[]) {
-  const { data } = await openai.embeddings.create({
-    model: 'text-embedding-3-small',
-    input: texts
-  });
-  return data.map(d => d.embedding);
+  const requests = texts.map((t) => ({
+    content: { role: 'user', parts: [{ text: t }] }
+  }));
+  const { embeddings } = await embedModel.batchEmbedContents({ requests });
+  return embeddings.map((e) => e.values);
 }
+
 
 async function crawl() {
   const seen = new Set<string>();
   const q: string[] = [...SEEDS];
-  const limiter = pLimit(CONCURRENCY);
   const results: {url:string, html:string}[] = [];
 
   while (q.length && results.length < MAX_PAGES) {
@@ -86,10 +126,8 @@ async function crawl() {
     try { u = new URL(url); } catch { continue; }
     if (!okHost(u)) continue;
 
-    await limiter(async () => {
-      const res = await fetch(url, { headers: { 'User-Agent': 'edu-research-bot/0.1' } });
-      if (!res.ok) return;
-      const html = await res.text();
+    try {
+      const html = await fetchUrl(url);
       results.push({ url, html });
 
       const $ = cheerio.load(html);
@@ -106,10 +144,11 @@ async function crawl() {
           }
         } catch {}
       });
-      await sleep(300);
-    });
+      await sleep(DELAY_MS);
+    } catch (error) {
+      console.error(`Error fetching ${url}:`, error);
+    }
   }
-  await sleep(100);
   return results;
 }
 
@@ -118,7 +157,7 @@ async function upsertDoc(d: { source: string, url: string, title: string, conten
   const { data: existing } = await supa.from('documents').select('id, sha256').eq('url', d.url).maybeSingle();
 
   let docId: string | undefined = existing?.id;
-  if (!existing || existing.sha256 != hash) {
+  if (!existing || existing.sha256 !== hash) {
     const { data: ins, error } = await supa.from('documents').upsert({
       source: d.source, url: d.url, title: d.title,
       published_at: d.published_at ? new Date(d.published_at).toISOString() : null,
